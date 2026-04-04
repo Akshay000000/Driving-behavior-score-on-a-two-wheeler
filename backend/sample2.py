@@ -25,8 +25,6 @@ try:
     BYTETRACK_AVAILABLE = True
 except ImportError:
     BYTETRACK_AVAILABLE = False
-    print("[WARN] boxmot not installed - using built-in IoU tracker")
-    print("[WARN] Run: pip install boxmot")
 
 # ============================= CONFIGURATION ================================ #
 
@@ -86,19 +84,19 @@ SPEED_LIMIT_MPS       = 13.9
 FLEET_K               = 0.6
 
 # -- Score weights -----------------------------------------------------------
-W_HARD_BRAKE   = 8
-W_AGGR_ACCEL   = 5
-W_WEAVE        = 3
-W_TAILGATE     = 6
-W_SUDDEN_STOP  = 7
-W_OVER_SPEED   = 0.25
+W_HARD_BRAKE   = 5
+W_AGGR_ACCEL   = 3
+W_WEAVE        = 2
+W_TAILGATE     = 4
+W_SUDDEN_STOP  = 5
+W_OVER_SPEED   = 0.15
 SCORE_EMA_ALPHA = 0.04
 COLOR_EMA_ALPHA = 0.02
 
 # -- Tracker / flow ----------------------------------------------------------
 IOU_MATCH_THRESH = 0.20
 MAX_DISAPPEARED  = 35
-EVENT_COOLDOWN   = 12
+EVENT_COOLDOWN   = 18
 WARMUP_FRAMES    = 8
 OF_MAX_CORNERS   = 200
 OF_QUALITY       = 0.01
@@ -268,8 +266,14 @@ class FleetContext:
         self.fleet_speed_mps = float(np.median(speeds)) if speeds else 0.0
         self.fleet_accel_mps2= float(np.clip(
             float(np.median(accels)) if accels else 0.0, -4.0, 4.0))
-        all_mpp=[float(np.median(list(bv._mpp_hist)))
-                 for bv in behaviors.values() if bv._mpp_hist]
+        # Only use mid-range vehicles for MPP — close vehicles (large bbox)
+        # and far vehicles (tiny bbox) produce unreliable scale estimates.
+        all_mpp=[]
+        for bv in behaviors.values():
+            if not bv._mpp_hist: continue
+            med=float(np.median(list(bv._mpp_hist)))
+            # MPP range 0.006-0.030 corresponds to vehicles 5-30m away
+            if 0.006 <= med <= 0.030: all_mpp.append(med)
         self._fleet_mpp_cache=float(np.median(all_mpp)) if all_mpp else 0.012
 
     def effective_brake_thr(self):
@@ -422,6 +426,7 @@ class RiderBehavior:
         self._cd=defaultdict(int)
 
         self.score=100.0; self._raw=100.0; self._committed=100.0
+        self.reliability=0.0  # 0-100: confidence in this track's data
 
     def _tick_cd(self):
         for k in list(self._cd): self._cd[k]=max(0,self._cd[k]-1)
@@ -456,9 +461,9 @@ class RiderBehavior:
                fleet, camera_speed_mps=0.0, cls=3):
         self._frame_n+=1; self._tick_cd(); self.cls=cls
 
-        # Update previous centroid every frame (critical for correct raw_dx)
-        if self._prev_cx is None:
-            self._prev_cx=float(cx); self._prev_cy=float(cy)
+        # Capture previous centroid BEFORE updating it
+        prev_cx = self._prev_cx if self._prev_cx is not None else float(cx)
+        prev_cy = self._prev_cy if self._prev_cy is not None else float(cy)
         self._prev_cx=float(cx); self._prev_cy=float(cy)
 
         bw=max(float(box[2]-box[0]),5.0)
@@ -474,10 +479,6 @@ class RiderBehavior:
         mpp=fleet_mpp if fleet_mpp>0.005 else float(np.median(list(self._mpp_hist)))
 
         # Kalman on ego-compensated centroid -> smooth velocity in px/frame
-        _, _, vx_k, vy_k = self._kalman.update(
-            cx-(comp_dx - comp_dx*0 + 0*cx),  # ego-compensated x
-            cy-(comp_dy - comp_dy*0 + 0*cy))   # ego-compensated y
-        # Simpler: feed comp centroid directly
         _, _, vx_k, vy_k = self._kalman.update(
             float(cx) - comp_dx,
             float(cy) - comp_dy)
@@ -530,7 +531,11 @@ class RiderBehavior:
                 and self.speed_mps<SUDDEN_STOP_SPEED_MPS):
             self._fire('stop','sudden_stop_count')
 
-        if self.speed_mps>SPEED_LIMIT_MPS: self.over_speed_sec+=self.dt
+        # Only flag over-speed for approaching/alongside vehicles.
+        # Receding vehicles read high relative speed by definition.
+        if (self.speed_mps>SPEED_LIMIT_MPS and
+                self.direction not in (DIR_RECEDING, DIR_UNKNOWN)):
+            self.over_speed_sec+=self.dt
         self._recompute()
 
     def _recompute(self):
@@ -544,6 +549,8 @@ class RiderBehavior:
         self._raw      =max(0.0,min(100.0,100.0-p))
         self.score     =SCORE_EMA_ALPHA*self._raw+(1-SCORE_EMA_ALPHA)*self.score
         self._committed=COLOR_EMA_ALPHA*self.score+(1-COLOR_EMA_ALPHA)*self._committed
+        # Reliability: rises with frame count, falls if track is barely visible
+        self.reliability=min(100.0, self._frame_n / max(WARMUP_FRAMES,1) * 30.0)
 
     def speed_kmh(self): return self.speed_mps*3.6
     def total_events(self):
@@ -575,12 +582,20 @@ def draw_hud(frame, rider, box):
     helm=("H+" if rider.helmet_status=="HELMET"
           else("X!" if rider.helmet_status=="NO_HELMET" else ""))
     still=" ST" if rider.is_stationary else ""
-    line1=f"#{rider.rider_id} {rider.score:.0f}/100  {rider.speed_kmh():.0f}km/h {dir_arrow}{still}"
+    rel=(f" R{rider.reliability:.0f}" if rider.reliability<80 else "")
+    line1=f"#{rider.rider_id} {rider.score:.0f}/100  {rider.speed_kmh():.0f}km/h {dir_arrow}{still}{rel}"
     line2=f"B{rider.hard_brake_count} W{rider.weave_count} T{rider.tailgate_count} S{rider.sudden_stop_count}"
     if helm: line2+=f"  {helm}"
-    ty=max(y1-34,0)
-    _safe_text(frame,line1,(x1,ty),0.38,color,1)
-    _safe_text(frame,line2,(x1,ty+16),0.34,(180,180,180),1)
+    ty=max(y1-36,0)
+    # Dark background strip so text is readable over any vehicle colour
+    strip_h=34
+    if ty>0:
+        ov2=frame.copy()
+        sx1=max(x1-2,0); sx2=min(x2+2,FRAME_W)
+        cv2.rectangle(ov2,(sx1,ty-2),(sx2,ty+strip_h),(0,0,0),-1)
+        cv2.addWeighted(ov2,0.45,frame,0.55,0,frame)
+    _safe_text(frame,line1,(x1,ty+12),0.38,color,1)
+    _safe_text(frame,line2,(x1,ty+26),0.34,(200,200,200),1)
 
 def draw_fleet_bar(frame,fleet,n_frame):
     ov=frame.copy()
@@ -615,6 +630,7 @@ def draw_leaderboard(frame,behaviors):
         cv2.rectangle(frame,(pane_x+28,y-10),(pane_x+28+ptw+6,y+4),col,-1)
         cv2.putText(frame,pill,(pane_x+31,y+2),
                     cv2.FONT_HERSHEY_SIMPLEX,0.40,(255,255,255),1,cv2.LINE_AA)
+        rel_c=(180,180,180) if b.reliability>=80 else (120,120,80)
         row_txt=f"#{b.rider_id:<2}        {b.speed_kmh():4.0f}  {b.total_events():2}"
         cv2.putText(frame,row_txt,(pane_x+4,y+2),
                     cv2.FONT_HERSHEY_SIMPLEX,0.35,col,1,cv2.LINE_AA)
@@ -622,6 +638,10 @@ def draw_leaderboard(frame,behaviors):
                 else((0,40,220) if b.helmet_status=="NO_HELMET"
                      else (140,140,140)))
         cv2.circle(frame,(FRAME_W-10,y-3),4,helm_c,-1)
+        # Reliability indicator: dim if track is new/unreliable
+        if b.reliability < 80:
+            cv2.putText(frame,"~",(pane_x+4,y+14),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.28,(120,120,80),1)
 
 def draw_footer(frame):
     ov=frame.copy()
@@ -704,10 +724,10 @@ def main():
 
     if BYTETRACK_AVAILABLE:
         tracker = ByteTrackWrapper(fps)
-        print("[INFO] Using ByteTrack")
+        print("[INFO] Tracker: ByteTrack")
     else:
         tracker = IoUTracker()
-        print("[INFO] Using built-in IoU tracker")
+        print("[INFO] Tracker: built-in IoU  (pip install boxmot for ByteTrack)")
     ego_est    = EgoMotionEstimator() if CAMERA_MODE=="dashcam" else None
     fleet      = FleetContext()
     helmet_det = HelmetDetector()
@@ -724,15 +744,21 @@ def main():
 
         raw_edx,raw_edy=(ego_est.update(gray) if ego_est else (0.0,0.0))
 
-        results=model(frame,conf=min(active_conf,PERSON_CONF),verbose=False)[0]
-        det_bikes=[]; person_boxes=[]
+        results=model(frame,conf=active_conf,verbose=False)[0]
+        det_bikes=[]; person_boxes=[]; det_cls_list=[]
         for b in results.boxes:
             cls=int(b.cls[0]); box=tuple(map(int,b.xyxy[0])); conf=float(b.conf[0])
-            if cls in active_classes and conf>=active_conf: det_bikes.append((box,cls))
+            if cls in active_classes and conf>=active_conf:
+                det_bikes.append((box,cls)); det_cls_list.append((box,cls))
             elif cls==0 and conf>=PERSON_CONF: person_boxes.append(box)
 
-        tracker.update([b for b,_ in det_bikes])
-        det_cls_map={b:c for b,c in det_bikes}
+        bike_boxes=[b for b,_ in det_bikes]
+        tracker.update(bike_boxes)
+        # List-based lookup avoids dict key collision on identical boxes
+        def get_cls(box, default=3):
+            for b,c in det_bikes:
+                if b==box: return c
+            return default
         active=tracker.active_tracks
 
         fleet.update(behaviors)
@@ -759,7 +785,7 @@ def main():
             else:
                 raw_dx=raw_dy=0.0
             comp_dx=raw_dx-edx_v; comp_dy=raw_dy-edy_v
-            det_cls=det_cls_map.get(td['box'],3)
+            det_cls=get_cls(td['box'])
             b.update(cx,cy,td['box'],comp_dx,comp_dy,fleet,
                      camera_speed_mps,det_cls)
             all_time[tid]=b
