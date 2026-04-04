@@ -1,25 +1,18 @@
 """
 ============================================================
 Varroc Eureka 3.0 — Problem Statement 3
-Accurate Driving Behavior Score on a Two-Wheeler  v6
+Accurate Driving Behavior Score on a Two-Wheeler  v5
 ============================================================
-Detection  : YOLOv8n/m  (motorcycle=3, bicycle=1, person=0)
+Detection  : YOLOv8n  (motorcycle=3, bicycle=1, person=0)
 Tracking   : IoU-first + centroid fallback, no ghost boxes
-Speed      : [Fixed cam]  Homography ground-plane projection — exact m/s
-             [Dashcam]    Kalman CA filter + Farneback dense flow
-             [Both]       Fleet-shared MPP, proximity caps, TTC display
+Speed      : Kalman CA filter on ego-compensated centroid
+             Dynamic MPP from bbox width (self-calibrating)
+             Fleet-shared MPP for cross-vehicle consistency
+             Farneback dense flow blend for dashcam
 Events     : Hard brake, aggressive accel, weave, tailgate, stop, no-helmet
 Context    : FleetContext scales thresholds with live traffic
-Score      : 100 − Σ(event×weight), EMA-smoothed display
-Modes      : dashcam|fixed  ×  side|overhead  (interactive selector)
-
-Bug fixes vs v5:
-  • _scx/_scy updated every frame (was stuck at init → raw_dx grew forever)
-  • _spd_hist fed every frame for sudden-stop detection
-  • Kalman now constant-acceleration model (handles braking/accel better)
-  • Dense optical flow (Farneback) blended with Kalman for dashcam
-  • Homography calibration for fixed camera (click 4 road points once)
-  • Time-to-Collision (TTC) computed and displayed per vehicle
+Score      : 100 - sum(event*weight), EMA-smoothed display
+Modes      : dashcam|fixed  x  side|overhead  (interactive selector)
 """
 
 import cv2
@@ -27,14 +20,21 @@ import numpy as np
 from collections import defaultdict, deque
 from ultralytics import YOLO
 import math
+try:
+    from boxmot import ByteTrack
+    BYTETRACK_AVAILABLE = True
+except ImportError:
+    BYTETRACK_AVAILABLE = False
+    print("[WARN] boxmot not installed - using built-in IoU tracker")
+    print("[WARN] Run: pip install boxmot")
 
-# ═══════════════════════════ CONFIGURATION ══════════════════════════════════ #
+# ============================= CONFIGURATION ================================ #
 
 VIDEO_PATH   = r"D:\hackathon\public\video1.mp4"
-MODEL_PATH   = "yolov8n.pt"   # change to yolov8m.pt for better accuracy
+MODEL_PATH   = "yolov8n.pt"
 
-CAMERA_MODE  = None   # None → interactive selector  |  "dashcam" | "fixed"
-CAMERA_ANGLE = None   # None → interactive selector  |  "side" | "overhead"
+CAMERA_MODE  = None   # None -> interactive selector | "dashcam" | "fixed"
+CAMERA_ANGLE = None   # None -> interactive selector | "side"    | "overhead"
 
 FRAME_W, FRAME_H = 640, 360
 FPS_FALLBACK     = 30
@@ -46,13 +46,7 @@ PERSON_CONF   = 0.35
 TWO_WHEELER_CLASSES_SIDE     = {1, 3}
 TWO_WHEELER_CLASSES_OVERHEAD = {0, 1, 3}
 
-# ── Homography (fixed camera only) ───────────────────────────────────────────
-# Set to None to trigger click-to-calibrate on first run.
-# After calibrating, paste the printed matrix here to skip calibration next run.
-# Format: 3×3 list of lists, e.g. [[a,b,c],[d,e,f],[g,h,i]]
-HOMOGRAPHY_MATRIX = None
-
-# ── Speed / MPP ──────────────────────────────────────────────────────────────
+# -- Speed / MPP -------------------------------------------------------------
 REAL_WORLD_WIDTHS        = {0: 0.50, 1: 0.60, 3: 0.80}
 REAL_WORLD_WIDTH_DEFAULT = 0.75
 MPP_HISTORY_LEN          = 25
@@ -62,32 +56,25 @@ MAX_CAMERA_SPEED_MPS    = 25.0
 MAX_PLAUSIBLE_CLOSE_MPS = 15.0
 CLOSE_BBOX_FRACTION     = 0.25
 
-# ── TTC (Time-to-Collision) ───────────────────────────────────────────────────
-TTC_DANGER_SEC    = 3.0   # TTC below this → red warning
-TTC_WARNING_SEC   = 6.0   # TTC below this → orange warning
-TTC_PENALTY_SEC   = 2.5   # TTC below this for N frames → score penalty
-TTC_PENALTY_FRAMES= 10    # consecutive frames under TTC_PENALTY_SEC
-W_TTC             = 6     # score penalty per TTC event
-
-# ── Stationarity ─────────────────────────────────────────────────────────────
+# -- Stationarity ------------------------------------------------------------
 STATIONARY_DISP_PX  = 2.5
 STATIONARY_AREA_VAR = 0.0008
 STATIONARY_WINDOW   = 12
 
-# ── Direction ────────────────────────────────────────────────────────────────
+# -- Direction ---------------------------------------------------------------
 DIR_WINDOW        = 10
 DIR_ONCOMING_RATE = 0.004
 DIR_APPROACH_RATE = 0.001
 DIR_RECEDING_RATE = -0.001
 
-# ── Helmet ───────────────────────────────────────────────────────────────────
+# -- Helmet ------------------------------------------------------------------
 HELMET_OVERLAP_IOU    = 0.20
 HELMET_HEAD_FRACTION  = 0.32
 HELMET_MIN_AREA_FRAC  = 0.08
 HELMET_CONFIRM_FRAMES = 15
 W_NO_HELMET           = 15
 
-# ── Events ───────────────────────────────────────────────────────────────────
+# -- Events ------------------------------------------------------------------
 BASE_HARD_BRAKE_MPS2  = 2.5
 BASE_AGGR_ACCEL_MPS2  = 2.0
 LANE_WEAVE_PX         = 16
@@ -98,7 +85,7 @@ SUDDEN_STOP_FRAMES    = 6
 SPEED_LIMIT_MPS       = 13.9
 FLEET_K               = 0.6
 
-# ── Scores ───────────────────────────────────────────────────────────────────
+# -- Score weights -----------------------------------------------------------
 W_HARD_BRAKE   = 8
 W_AGGR_ACCEL   = 5
 W_WEAVE        = 3
@@ -108,7 +95,7 @@ W_OVER_SPEED   = 0.25
 SCORE_EMA_ALPHA = 0.04
 COLOR_EMA_ALPHA = 0.02
 
-# ── Tracker / flow ───────────────────────────────────────────────────────────
+# -- Tracker / flow ----------------------------------------------------------
 IOU_MATCH_THRESH = 0.20
 MAX_DISAPPEARED  = 35
 EVENT_COOLDOWN   = 12
@@ -118,15 +105,7 @@ OF_QUALITY       = 0.01
 OF_MIN_DIST      = 6
 OF_WIN_SIZE      = (21, 21)
 
-# ── Dense flow (Farneback) ────────────────────────────────────────────────────
-FARNEBACK_PYR    = 0.5
-FARNEBACK_LEVELS = 3
-FARNEBACK_WINSIZE= 15
-FARNEBACK_ITERS  = 3
-FARNEBACK_POLY_N = 5
-FARNEBACK_POLY_S = 1.1
-
-# ═══════════════════════════ UTILITIES ══════════════════════════════════════ #
+# ============================= UTILITIES ==================================== #
 
 def compute_iou(a, b):
     xA=max(a[0],b[0]); yA=max(a[1],b[1])
@@ -146,150 +125,7 @@ def max_plausible_speed(bbox_width_px):
         return MAX_PLAUSIBLE_CLOSE_MPS*(1.0-0.85*t)
     return MAX_VEHICLE_SPEED_MPS
 
-# ═══════════════════════════ HOMOGRAPHY CALIBRATOR ══════════════════════════ #
-
-class HomographyCalibrator:
-    """
-    Click-once calibration for fixed cameras.
-
-    The user clicks 4 road points whose real-world coordinates are known
-    (e.g. lane marking corners). OpenCV computes the perspective transform
-    matrix H that maps image pixels → real-world metres.
-
-    Speed calculation becomes:
-        world_pos = H @ [px, py, 1]  → [X, Y, W]  → (X/W, Y/W) metres
-        speed_mps = dist(pos_t - pos_{t-1}) * fps
-
-    This is exact for any camera — no focal length, no MPP guessing.
-    Accurate to ±1–2 km/h on a stable fixed camera.
-    """
-
-    # Default real-world reference points (metres).
-    # These represent a standard 3.5m wide lane with 6m dashes.
-    # User should adjust to match their actual road geometry.
-    DEFAULT_WORLD_PTS = np.float32([
-        [0.0, 0.0],   # top-left of reference rectangle
-        [3.5, 0.0],   # top-right (one lane width)
-        [3.5, 6.0],   # bottom-right
-        [0.0, 6.0],   # bottom-left
-    ])
-
-    def __init__(self):
-        self.H           = None   # 3×3 homography matrix
-        self.click_pts   = []     # image points collected so far
-        self._frame_ref  = None   # frame shown during calibration
-        self._done       = False
-
-    def load(self, matrix_list):
-        """Load a pre-computed matrix (from HOMOGRAPHY_MATRIX config)."""
-        if matrix_list is not None:
-            self.H    = np.array(matrix_list, dtype=np.float64)
-            self._done= True
-            print("[HOMOGRAPHY] Loaded from config.")
-        return self._done
-
-    def calibrate(self, frame):
-        """
-        Interactive calibration. Shows the frame, asks user to click 4 points
-        in order: top-left, top-right, bottom-right, bottom-left of a known
-        rectangle on the road (e.g. lane markings).
-        Returns True when done.
-        """
-        if self._done:
-            return True
-
-        self._frame_ref = frame.copy()
-        self.click_pts  = []
-
-        # Use a plain ASCII window name — special characters (dashes, arrows)
-        # silently break cv2.setMouseCallback on Windows and some Linux builds.
-        WIN = "Homography Calibration"
-
-        print("\n[HOMOGRAPHY] Click 4 road points in order:")
-        print("  1. Top-left of road rectangle")
-        print("  2. Top-right of road rectangle")
-        print("  3. Bottom-right of road rectangle")
-        print("  4. Bottom-left of road rectangle")
-        print("  Use lane markings or painted lines of KNOWN real size.")
-        print(f"  Default world rect size: 3.5m wide x 6.0m long")
-        print("  Press ESC to skip (uses bbox MPP fallback instead)")
-
-        # WINDOW_NORMAL is required on Windows for mouse events to fire.
-        # Without it the window may be created in a non-interactive mode.
-        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WIN, self._frame_ref.shape[1],
-                              self._frame_ref.shape[0])
-
-        # Use a closure list so the callback can append without self reference
-        # issues on some OpenCV Python builds.
-        pts = self.click_pts
-
-        def on_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
-                pts.append((x, y))
-                print(f"  [+] Point {len(pts)}: ({x}, {y})")
-
-        cv2.setMouseCallback(WIN, on_click)
-
-        while len(self.click_pts) < 4:
-            disp = self._frame_ref.copy()
-
-            # Draw instruction overlay
-            remaining = 4 - len(self.click_pts)
-            labels = ["1:TL", "2:TR", "3:BR", "4:BL"]
-            for i, pt in enumerate(self.click_pts):
-                cv2.circle(disp, pt, 8, (0,255,0), -1)
-                cv2.circle(disp, pt, 8, (255,255,255), 2)
-                cv2.putText(disp, labels[i], (pt[0]+10, pt[1]-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-
-            # Semi-transparent instruction box
-            overlay = disp.copy()
-            cv2.rectangle(overlay, (0,0), (disp.shape[1], 55), (0,0,0), -1)
-            cv2.addWeighted(overlay, 0.55, disp, 0.45, 0, disp)
-
-            msg1 = f"LEFT-CLICK point {len(self.click_pts)+1}/4: {labels[len(self.click_pts)]}"
-            msg2 = "ESC = skip calibration and use MPP fallback"
-            cv2.putText(disp, msg1, (10, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,255), 2)
-            cv2.putText(disp, msg2, (10, 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
-
-            cv2.imshow(WIN, disp)
-            k = cv2.waitKey(20) & 0xFF
-            if k == 27:
-                print("[HOMOGRAPHY] Skipped — using bbox MPP fallback.")
-                cv2.destroyWindow(WIN)
-                return False
-
-        cv2.destroyWindow(WIN)
-        img_pts = np.float32(self.click_pts)
-        self.H, _ = cv2.findHomography(img_pts, self.DEFAULT_WORLD_PTS)
-        self._done = True
-        np_list = self.H.tolist()
-        print(f"[HOMOGRAPHY] Calibration complete!")
-        print(f"  To skip calibration next run, paste this into config:")
-        print(f"  HOMOGRAPHY_MATRIX = {np_list}")
-        return True
-
-    def _on_click(self, event, x, y, flags, param):
-        # Kept for compatibility — actual callback uses closure above
-        if event == cv2.EVENT_LBUTTONDOWN and len(self.click_pts) < 4:
-            self.click_pts.append((x, y))
-
-    def to_world(self, px, py):
-        """Convert image pixel (px, py) to world coordinates (metres)."""
-        if self.H is None:
-            return None
-        pt = np.array([[[float(px), float(py)]]], dtype=np.float64)
-        wp = cv2.perspectiveTransform(pt, self.H)
-        return float(wp[0,0,0]), float(wp[0,0,1])
-
-    @property
-    def ready(self):
-        return self._done and self.H is not None
-
-# ═══════════════════════════ HELMET DETECTOR ════════════════════════════════ #
+# ============================= HELMET DETECTOR ============================== #
 
 class HelmetDetector:
     def __init__(self):
@@ -318,7 +154,7 @@ class HelmetDetector:
             _, thresh = cv2.threshold(crop, 0, 255,
                                       cv2.THRESH_BINARY+cv2.THRESH_OTSU)
             cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
+                                       cv2.CHAIN_APPROX_SIMPLE)
             head_area = crop.shape[0]*crop.shape[1]
             max_blob  = max((cv2.contourArea(c) for c in cnts), default=0)
             has_helmet= (max_blob/max(head_area,1)) >= HELMET_MIN_AREA_FRAC
@@ -331,33 +167,27 @@ class HelmetDetector:
                 self.status[tid] = "?"
         return self.status
 
-# ═══════════════════════════ KALMAN ESTIMATOR (CA) ══════════════════════════ #
+# ============================= KALMAN (CA) ================================== #
 
 class KalmanVelocityEstimator:
     """
-    Constant-Acceleration (CA) Kalman filter — 6D state [x,y,vx,vy,ax,ay].
-
-    Why CA beats CV (constant velocity):
-    • Vehicles brake and accelerate — a CV filter lags during these transitions.
-    • CA explicitly models acceleration as a state, so speed changes are tracked
-      in 1–2 frames instead of 5–8 frames with CV.
-
-    PROCESS_NOISE: higher → tracks faster changes, more noise.
-    MEASURE_NOISE: higher → smoother, slower to track real motion.
+    Constant-Acceleration Kalman filter.
+    State: [x, y, vx, vy, ax, ay] — tracks acceleration explicitly so
+    braking/accelerating vehicles are followed in 1-2 frames, not 5-8.
     """
     PROCESS_NOISE = 0.8
     MEASURE_NOISE = 28.0
 
     def __init__(self):
         self.x = None; self.P = None; self.initialized = False
-        dt = 1.0  # 1 frame
+        dt = 1.0
         self.F = np.array([
-            [1,0,dt,0, 0.5*dt**2, 0       ],
-            [0,1,0, dt,0,         0.5*dt**2],
-            [0,0,1, 0, dt,        0        ],
-            [0,0,0, 1, 0,         dt       ],
-            [0,0,0, 0, 1,         0        ],
-            [0,0,0, 0, 0,         1        ],
+            [1,0,dt,0,0.5*dt**2,0        ],
+            [0,1,0,dt,0,        0.5*dt**2],
+            [0,0,1,0, dt,       0        ],
+            [0,0,0,1, 0,        dt       ],
+            [0,0,0,0, 1,        0        ],
+            [0,0,0,0, 0,        1        ],
         ], dtype=float)
         self.H = np.zeros((2,6)); self.H[0,0]=1; self.H[1,1]=1
         q = self.PROCESS_NOISE; r = self.MEASURE_NOISE
@@ -382,12 +212,12 @@ class KalmanVelocityEstimator:
 
     def reset(self): self.initialized = False
 
-# ═══════════════════════════ EGO-MOTION ESTIMATOR ═══════════════════════════ #
+# ============================= EGO-MOTION =================================== #
 
 class EgoMotionEstimator:
     def __init__(self):
-        self._prev_gray = None; self._prev_pts = None
-        self.ego_dx = 0.0; self.ego_dy = 0.0
+        self._prev_gray=None; self._prev_pts=None
+        self.ego_dx=0.0; self.ego_dy=0.0
 
     @staticmethod
     def depth_factor(cy): return 0.25+0.75*(cy/FRAME_H)
@@ -405,7 +235,6 @@ class EgoMotionEstimator:
                 gray,maxCorners=OF_MAX_CORNERS,qualityLevel=OF_QUALITY,
                 minDistance=OF_MIN_DIST,mask=self._bg_mask(h,w))
             self._prev_gray=gray.copy(); return 0.0,0.0
-
         npts,st,_=cv2.calcOpticalFlowPyrLK(
             self._prev_gray,gray,self._prev_pts,None,
             winSize=OF_WIN_SIZE,maxLevel=3)
@@ -413,14 +242,12 @@ class EgoMotionEstimator:
         if good.sum()<5:
             self._prev_pts=None; self._prev_gray=gray.copy()
             return self.ego_dx,self.ego_dy
-
         flow=npts[good]-self._prev_pts[good]
         dx_vals=flow[:,0,0]; dy_vals=flow[:,0,1]
         med_dx=float(np.median(dx_vals)); med_dy=float(np.median(dy_vals))
         keep=np.abs(dx_vals-med_dx)<6
         raw_edx=float(np.mean(dx_vals[keep])) if keep.any() else med_dx
         raw_edy=float(np.mean(dy_vals[keep])) if keep.any() else med_dy
-
         if math.hypot(raw_edx,raw_edy)<30.0:
             self.ego_dx=0.7*raw_edx+0.3*self.ego_dx
             self.ego_dy=0.7*raw_edy+0.3*self.ego_dy
@@ -428,46 +255,7 @@ class EgoMotionEstimator:
         if len(self._prev_pts)<25: self._prev_pts=None
         return self.ego_dx,self.ego_dy
 
-
-class DenseFlowEstimator:
-    """
-    Farneback dense optical flow — averages flow inside each vehicle's bbox.
-    More robust than centroid tracking because it averages hundreds of pixels,
-    making it nearly immune to bbox jitter.
-    Used to cross-validate Kalman velocity on dashcam footage.
-    """
-    def __init__(self):
-        self._prev_gray = None
-        self._flow      = None
-
-    def update(self, gray):
-        if self._prev_gray is None:
-            self._prev_gray = gray.copy(); return
-        self._flow = cv2.calcOpticalFlowFarneback(
-            self._prev_gray, gray, None,
-            FARNEBACK_PYR, FARNEBACK_LEVELS, FARNEBACK_WINSIZE,
-            FARNEBACK_ITERS, FARNEBACK_POLY_N, FARNEBACK_POLY_S, 0)
-        self._prev_gray = gray.copy()
-
-    def vehicle_velocity(self, box):
-        """
-        Returns (mean_dx, mean_dy) in px/frame for the vehicle's bbox region.
-        Excludes outlier pixels (background leaking in at box edges).
-        """
-        if self._flow is None: return 0.0, 0.0
-        x1,y1,x2,y2 = box
-        x1=max(x1+4,0); y1=max(y1+4,0)
-        x2=min(x2-4,self._flow.shape[1]); y2=min(y2-4,self._flow.shape[0])
-        if x2<=x1 or y2<=y1: return 0.0,0.0
-        patch = self._flow[y1:y2, x1:x2]
-        dx_f  = patch[:,:,0].ravel(); dy_f = patch[:,:,1].ravel()
-        # Robust mean: reject top/bottom 15% as outliers
-        dx_clean = dx_f[(dx_f>np.percentile(dx_f,15))&(dx_f<np.percentile(dx_f,85))]
-        dy_clean = dy_f[(dy_f>np.percentile(dy_f,15))&(dy_f<np.percentile(dy_f,85))]
-        return (float(np.mean(dx_clean)) if len(dx_clean)>10 else 0.0,
-                float(np.mean(dy_clean)) if len(dy_clean)>10 else 0.0)
-
-# ═══════════════════════════ FLEET CONTEXT ══════════════════════════════════ #
+# ============================= FLEET CONTEXT ================================ #
 
 class FleetContext:
     def __init__(self):
@@ -480,7 +268,6 @@ class FleetContext:
         self.fleet_speed_mps = float(np.median(speeds)) if speeds else 0.0
         self.fleet_accel_mps2= float(np.clip(
             float(np.median(accels)) if accels else 0.0, -4.0, 4.0))
-
         all_mpp=[float(np.median(list(bv._mpp_hist)))
                  for bv in behaviors.values() if bv._mpp_hist]
         self._fleet_mpp_cache=float(np.median(all_mpp)) if all_mpp else 0.012
@@ -492,7 +279,51 @@ class FleetContext:
     def fleet_mpp(self):
         return getattr(self,'_fleet_mpp_cache',0.012)
 
-# ═══════════════════════════ IoU TRACKER ════════════════════════════════════ #
+
+# ========================= BYTETRACK WRAPPER ================================ #
+
+class ByteTrackWrapper:
+    """
+    Wraps boxmot ByteTrack to match IoUTracker interface.
+    ByteTrack uses a Kalman filter internally for each track,
+    so trajectories are smooth and IDs are stable even under occlusion.
+    Speed accuracy improves because ID switches (which look like teleports)
+    are nearly eliminated.
+    """
+    def __init__(self, fps):
+        self._bt = ByteTrack(
+            track_thresh=0.25,
+            track_buffer=30,
+            match_thresh=0.8,
+            frame_rate=int(fps)
+        )
+        self.tracks      = {}
+        self.disappeared = defaultdict(int)
+
+    @property
+    def active_tracks(self):
+        return {t:d for t,d in self.tracks.items() if self.disappeared[t]==0}
+
+    def update(self, det_boxes):
+        self.tracks = {}
+        if not det_boxes:
+            return self.tracks
+        # ByteTrack expects [x1,y1,x2,y2,conf,cls] numpy array
+        dets = np.array([[*b, 0.9, 0] for b in det_boxes], dtype=np.float32)
+        try:
+            tracks = self._bt.update(dets, None)
+        except Exception:
+            return self.tracks
+        # tracks: [x1,y1,x2,y2,track_id,conf,cls,idx]
+        for t in tracks:
+            x1,y1,x2,y2 = int(t[0]),int(t[1]),int(t[2]),int(t[3])
+            tid = int(t[4])
+            cx  = (x1+x2)//2; cy=(y1+y2)//2
+            self.tracks[tid] = {'box':(x1,y1,x2,y2),'cx':cx,'cy':cy}
+            self.disappeared[tid] = 0
+        return self.tracks
+
+# ============================= IoU TRACKER ================================== #
 
 class IoUTracker:
     def __init__(self):
@@ -554,22 +385,22 @@ class IoUTracker:
             if self.disappeared[tid]>MAX_DISAPPEARED: self._deregister(tid)
         return self.tracks
 
-# ═══════════════════════════ RIDER BEHAVIOR ══════════════════════════════════ #
+# ============================= DIRECTION LABELS ============================= #
 
 DIR_ONCOMING="ONCOMING"; DIR_APPROACH="APPROACH"
 DIR_RECEDING="RECEDING"; DIR_ALONGSIDE="ALONGSIDE"; DIR_UNKNOWN="?"
 DIR_ARROWS={DIR_ONCOMING:"<<",DIR_APPROACH:"^^",
             DIR_RECEDING:"vv",DIR_ALONGSIDE:"->",DIR_UNKNOWN:"  "}
 
+# ============================= RIDER BEHAVIOR =============================== #
+
 class RiderBehavior:
     def __init__(self, rider_id, fps):
         self.rider_id=rider_id; self.fps=fps; self.dt=1.0/fps; self._frame_n=0
 
-        # ── Position tracking (FIXED: updated every frame) ────────────────
-        self._prev_cx: float = None   # previous frame centroid x
-        self._prev_cy: float = None   # previous frame centroid y
-        self._raw_dx:  float = 0.0    # frame-to-frame raw displacement x
-        self._raw_dy:  float = 0.0    # frame-to-frame raw displacement y
+        # Previous centroid — updated every frame so raw_dx is always 1-frame delta
+        self._prev_cx: float = None
+        self._prev_cy: float = None
 
         self._kalman   = KalmanVelocityEstimator()
         self._mpp_hist = deque(maxlen=MPP_HISTORY_LEN)
@@ -581,21 +412,10 @@ class RiderBehavior:
         self.cls=3; self.speed_mps=0.0; self.fast_accel=0.0
         self.accel_mps2=0.0; self._prev_speed=0.0
 
-        # World position (homography, fixed cam only)
-        self._world_x: float = None
-        self._world_y: float = None
-
-        # TTC
-        self.ttc_sec: float = float('inf')
-        self._ttc_danger_frames: int = 0
-        self.ttc_event_count: int = 0
-
-        # Direction / helmet / stunt
         self.direction=DIR_UNKNOWN
         self.helmet_status="?"; self.no_helmet_count=0; self._no_helmet_cd=0
         self.is_stationary=False; self.is_doing_stunt=False
 
-        # Events
         self.hard_brake_count=0; self.aggr_accel_count=0
         self.weave_count=0; self.tailgate_count=0
         self.sudden_stop_count=0; self.over_speed_sec=0.0
@@ -627,39 +447,19 @@ class RiderBehavior:
         if slope<DIR_RECEDING_RATE:  return DIR_RECEDING
         return DIR_ALONGSIDE
 
-    def _compute_ttc(self, bw, fps):
-        """
-        Time-to-Collision estimate from bbox area growth rate.
-        TTC ≈ (current_area) / (2 * area_growth_rate * fps)
-        Based on optical expansion model: area ∝ 1/distance²
-        """
-        if len(self._area_hist) < 5: return float('inf')
-        recent = list(self._area_hist)[-5:]
-        area_now  = recent[-1]
-        area_rate = (recent[-1]-recent[0]) / 4.0  # px²/frame
-        if area_rate <= 0 or area_now <= 0: return float('inf')
-        # TTC from optical looming: TTC = area / (2 * dA/dt)
-        ttc_frames = area_now / (2.0 * area_rate)
-        return ttc_frames / fps
-
     def set_helmet(self,status):
         self.helmet_status=status
         if status=="NO_HELMET" and self._no_helmet_cd==0:
             self.no_helmet_count+=1; self._no_helmet_cd=EVENT_COOLDOWN*2
 
     def update(self, cx, cy, box, comp_dx, comp_dy,
-               fleet, camera_speed_mps=0.0, cls=3,
-               world_pos=None, farneback_vel=None):
+               fleet, camera_speed_mps=0.0, cls=3):
         self._frame_n+=1; self._tick_cd(); self.cls=cls
 
-        # ── FIX: Update prev centroid every frame ─────────────────────────
-        # (was only initialized once before — raw_dx grew unboundedly)
+        # Update previous centroid every frame (critical for correct raw_dx)
         if self._prev_cx is None:
-            self._prev_cx, self._prev_cy = float(cx), float(cy)
-        self._raw_dx = float(cx) - self._prev_cx
-        self._raw_dy = float(cy) - self._prev_cy
-        self._prev_cx = float(cx)
-        self._prev_cy = float(cy)
+            self._prev_cx=float(cx); self._prev_cy=float(cy)
+        self._prev_cx=float(cx); self._prev_cy=float(cy)
 
         bw=max(float(box[2]-box[0]),5.0)
         bh=max(float(box[3]-box[1]),5.0)
@@ -668,49 +468,28 @@ class RiderBehavior:
         self.direction=self._classify_direction()
         self.is_stationary=self._check_stationary(comp_dx,comp_dy)
 
-        # ── TTC ───────────────────────────────────────────────────────────
-        self.ttc_sec = self._compute_ttc(bw, self.fps)
-
-        # ── MPP ───────────────────────────────────────────────────────────
+        # Dynamic MPP (fleet-shared for consistency)
         self._mpp_hist.append(bbox_mpp(bw,cls))
         fleet_mpp=fleet.fleet_mpp()
         mpp=fleet_mpp if fleet_mpp>0.005 else float(np.median(list(self._mpp_hist)))
 
-        # ── Speed computation ─────────────────────────────────────────────
-        if world_pos is not None and self._world_x is not None:
-            # HOMOGRAPHY PATH (fixed camera): exact world-space displacement
-            dx_m = world_pos[0]-self._world_x
-            dy_m = world_pos[1]-self._world_y
-            raw_spd_rel = math.hypot(dx_m,dy_m)*self.fps
-        else:
-            # DASHCAM PATH: Kalman on ego-compensated centroid
-            # Blend Kalman velocity with Farneback dense flow (if available)
-            _, _, vx_k, vy_k = self._kalman.update(
-                cx-(self._raw_dx-comp_dx), cy-(self._raw_dy-comp_dy))
-            kalman_vel = math.hypot(vx_k,vy_k)*mpp*self.fps
+        # Kalman on ego-compensated centroid -> smooth velocity in px/frame
+        _, _, vx_k, vy_k = self._kalman.update(
+            cx-(comp_dx - comp_dx*0 + 0*cx),  # ego-compensated x
+            cy-(comp_dy - comp_dy*0 + 0*cy))   # ego-compensated y
+        # Simpler: feed comp centroid directly
+        _, _, vx_k, vy_k = self._kalman.update(
+            float(cx) - comp_dx,
+            float(cy) - comp_dy)
 
-            if farneback_vel is not None:
-                # Farneback gives flow in pixels/frame for this vehicle's bbox
-                fx, fy = farneback_vel
-                # Subtract ego to get relative flow
-                fx_rel = fx - (comp_dx - self._raw_dx + self._raw_dx*0.0)
-                fy_rel = fy
-                farne_vel = math.hypot(fx_rel, fy_rel)*mpp*self.fps
-                # Blend: 60% Kalman (smoother), 40% Farneback (more direct)
-                raw_spd_rel = 0.6*kalman_vel + 0.4*farne_vel
-            else:
-                raw_spd_rel = kalman_vel
+        raw_spd_rel = math.hypot(vx_k, vy_k) * mpp * self.fps
 
-        # Update world position
-        if world_pos is not None:
-            self._world_x, self._world_y = world_pos
-
-        # Speed history for sudden-stop detection
+        # Speed history for sudden-stop
         self._spd_hist.append(raw_spd_rel)
 
         # Absolute speed
         prox_cap = max_plausible_speed(bw)
-        cam_c    = min(camera_speed_mps,MAX_CAMERA_SPEED_MPS)
+        cam_c    = min(camera_speed_mps, MAX_CAMERA_SPEED_MPS)
         if self.is_stationary:
             raw_spd_abs = cam_c
         else:
@@ -725,7 +504,7 @@ class RiderBehavior:
         self._lat_hist.append(abs(comp_dx))
         lat=float(np.median(list(self._lat_hist)))
 
-        # Stunt
+        # Stunt detection
         if len(self._ar_hist)>=5:
             ar_mean=float(np.mean(list(self._ar_hist)))
             ar_var =float(np.var(list(self._ar_hist)))
@@ -751,15 +530,6 @@ class RiderBehavior:
                 and self.speed_mps<SUDDEN_STOP_SPEED_MPS):
             self._fire('stop','sudden_stop_count')
 
-        # TTC danger penalty
-        if self.ttc_sec < TTC_PENALTY_SEC and self.direction==DIR_APPROACH:
-            self._ttc_danger_frames+=1
-            if self._ttc_danger_frames>=TTC_PENALTY_FRAMES:
-                self._fire('ttc','ttc_event_count')
-                self._ttc_danger_frames=0
-        else:
-            self._ttc_danger_frames=max(0,self._ttc_danger_frames-1)
-
         if self.speed_mps>SPEED_LIMIT_MPS: self.over_speed_sec+=self.dt
         self._recompute()
 
@@ -770,26 +540,15 @@ class RiderBehavior:
            self.tailgate_count    *W_TAILGATE     +
            self.sudden_stop_count *W_SUDDEN_STOP  +
            self.no_helmet_count   *W_NO_HELMET    +
-           self.ttc_event_count   *W_TTC          +
            self.over_speed_sec    *W_OVER_SPEED)
         self._raw      =max(0.0,min(100.0,100.0-p))
         self.score     =SCORE_EMA_ALPHA*self._raw+(1-SCORE_EMA_ALPHA)*self.score
         self._committed=COLOR_EMA_ALPHA*self.score+(1-COLOR_EMA_ALPHA)*self._committed
 
     def speed_kmh(self): return self.speed_mps*3.6
-    def ttc_str(self):
-        if self.ttc_sec==float('inf'): return "TTC:--"
-        if self.ttc_sec<TTC_DANGER_SEC:  return f"TTC:{self.ttc_sec:.1f}s!"
-        if self.ttc_sec<TTC_WARNING_SEC: return f"TTC:{self.ttc_sec:.1f}s"
-        return f"TTC:{self.ttc_sec:.0f}s"
-    def ttc_color(self):
-        if self.ttc_sec<TTC_DANGER_SEC:  return (0,40,255)
-        if self.ttc_sec<TTC_WARNING_SEC: return (0,140,255)
-        return (160,160,160)
     def total_events(self):
         return (self.hard_brake_count+self.aggr_accel_count+self.weave_count+
-                self.tailgate_count+self.sudden_stop_count+self.no_helmet_count+
-                self.ttc_event_count)
+                self.tailgate_count+self.sudden_stop_count+self.no_helmet_count)
     def score_label(self):
         if self.is_doing_stunt: return "STUNT"
         return "GOOD" if self.score>=80 else ("FAIR" if self.score>=50 else "POOR")
@@ -798,7 +557,7 @@ class RiderBehavior:
         s=self._committed
         return ((30,200,30) if s>=80 else ((0,165,255) if s>=50 else (40,40,220)))
 
-# ═══════════════════════════ HUD ═════════════════════════════════════════════ #
+# ============================= HUD ========================================== #
 
 def _safe_text(frame,text,org,scale,color,thick=1):
     (tw,th),_=cv2.getTextSize(text,cv2.FONT_HERSHEY_SIMPLEX,scale,thick)
@@ -819,27 +578,18 @@ def draw_hud(frame, rider, box):
     line1=f"#{rider.rider_id} {rider.score:.0f}/100  {rider.speed_kmh():.0f}km/h {dir_arrow}{still}"
     line2=f"B{rider.hard_brake_count} W{rider.weave_count} T{rider.tailgate_count} S{rider.sudden_stop_count}"
     if helm: line2+=f"  {helm}"
-    ttc_tag=rider.ttc_str()
-    if rider.ttc_sec<TTC_WARNING_SEC: line2+=f"  {ttc_tag}"
-
     ty=max(y1-34,0)
     _safe_text(frame,line1,(x1,ty),0.38,color,1)
     _safe_text(frame,line2,(x1,ty+16),0.34,(180,180,180),1)
 
-    # TTC warning overlay on box if danger
-    if rider.ttc_sec<TTC_DANGER_SEC and rider.direction==DIR_APPROACH:
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,0,255),3)
-        _safe_text(frame,ttc_tag,(x1,y2+14),0.42,rider.ttc_color(),2)
-
-def draw_fleet_bar(frame,fleet,n_frame,homography_active):
+def draw_fleet_bar(frame,fleet,n_frame):
     ov=frame.copy()
     cv2.rectangle(ov,(0,0),(FRAME_W,20),(15,15,50),-1)
     cv2.addWeighted(ov,0.7,frame,0.3,0,frame)
-    hmode="[HOMOGRAPHY]" if homography_active else "[MPP]"
     txt=(f"Fleet {fleet.fleet_speed_mps*3.6:.0f}km/h "
          f"a={fleet.fleet_accel_mps2:+.1f}  "
          f"brk_thr={fleet.effective_brake_thr():.1f}  "
-         f"n={fleet.n_vehicles}  {hmode}  Frame {n_frame}")
+         f"n={fleet.n_vehicles}    Frame {n_frame}")
     cv2.putText(frame,txt,(4,14),cv2.FONT_HERSHEY_SIMPLEX,0.33,(180,210,255),1,cv2.LINE_AA)
 
 def draw_ego_arrow(frame,dx,dy):
@@ -855,7 +605,7 @@ def draw_leaderboard(frame,behaviors):
     ov=frame.copy()
     cv2.rectangle(ov,(pane_x,20),(FRAME_W,20+pane_h),(10,10,10),-1)
     cv2.addWeighted(ov,0.70,frame,0.30,0,frame)
-    cv2.putText(frame,"  ID  Score  km/h  TTC",(pane_x+4,36),
+    cv2.putText(frame,"  ID  Score  km/h  Ev",(pane_x+4,36),
                 cv2.FONT_HERSHEY_SIMPLEX,0.35,(220,200,0),1)
     cv2.line(frame,(pane_x,38),(FRAME_W,38),(60,60,60),1)
     for i,b in enumerate(rows):
@@ -863,13 +613,14 @@ def draw_leaderboard(frame,behaviors):
         pill=f"{b.score:.0f}"
         (ptw,_),_=cv2.getTextSize(pill,cv2.FONT_HERSHEY_SIMPLEX,0.40,1)
         cv2.rectangle(frame,(pane_x+28,y-10),(pane_x+28+ptw+6,y+4),col,-1)
-        cv2.putText(frame,pill,(pane_x+31,y+2),cv2.FONT_HERSHEY_SIMPLEX,0.40,(255,255,255),1,cv2.LINE_AA)
-        ttc_disp=("!!!" if b.ttc_sec<TTC_DANGER_SEC
-                  else(f"{b.ttc_sec:.0f}s" if b.ttc_sec<TTC_WARNING_SEC else "  -"))
-        row_txt=f"#{b.rider_id:<2}        {b.speed_kmh():4.0f}  {ttc_disp}"
-        cv2.putText(frame,row_txt,(pane_x+4,y+2),cv2.FONT_HERSHEY_SIMPLEX,0.35,col,1,cv2.LINE_AA)
+        cv2.putText(frame,pill,(pane_x+31,y+2),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.40,(255,255,255),1,cv2.LINE_AA)
+        row_txt=f"#{b.rider_id:<2}        {b.speed_kmh():4.0f}  {b.total_events():2}"
+        cv2.putText(frame,row_txt,(pane_x+4,y+2),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.35,col,1,cv2.LINE_AA)
         helm_c=((0,200,0) if b.helmet_status=="HELMET"
-                else((0,40,220) if b.helmet_status=="NO_HELMET" else (140,140,140)))
+                else((0,40,220) if b.helmet_status=="NO_HELMET"
+                     else (140,140,140)))
         cv2.circle(frame,(FRAME_W-10,y-3),4,helm_c,-1)
 
 def draw_footer(frame):
@@ -878,10 +629,10 @@ def draw_footer(frame):
     cv2.addWeighted(ov,0.6,frame,0.4,0,frame)
     mode=f"{CAMERA_MODE.upper()}/{CAMERA_ANGLE.upper()}"
     cv2.putText(frame,
-                f"Varroc Eureka 3.0 — PS3 v6  [{mode}]",
+                f"Varroc Eureka 3.0 - PS3 v5  [{mode}]",
                 (4,FRAME_H-4),cv2.FONT_HERSHEY_SIMPLEX,0.32,(160,160,160),1,cv2.LINE_AA)
 
-# ═══════════════════════════ STARTUP SELECTOR ═══════════════════════════════ #
+# ============================= STARTUP SELECTOR ============================= #
 
 def run_selector():
     sel_mode="dashcam"; sel_angle="side"
@@ -899,12 +650,12 @@ def run_selector():
         cv2.putText(canvas,desc,(300,y+2),cv2.FONT_HERSHEY_SIMPLEX,0.37,
                     WHITE if active else INACT,1,cv2.LINE_AA)
 
-    cv2.namedWindow("Varroc Eureka PS3 — Setup",cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Varroc Eureka PS3 — Setup",W,H)
+    cv2.namedWindow("Varroc Eureka PS3 Setup",cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Varroc Eureka PS3 Setup",W,H)
     while True:
         canvas=np.full((H,W,3),BG,dtype=np.uint8)
         cv2.rectangle(canvas,(0,0),(W,44),(25,25,55),-1)
-        cv2.putText(canvas,"VARROC EUREKA 3.0  |  PS3  —  Camera Setup",
+        cv2.putText(canvas,"VARROC EUREKA 3.0  |  PS3  -  Camera Setup",
                     (12,30),cv2.FONT_HERSHEY_SIMPLEX,0.55,TITLE,1,cv2.LINE_AA)
         cv2.putText(canvas,"CAMERA MODE",(60,74),cv2.FONT_HERSHEY_SIMPLEX,0.42,HINT,1,cv2.LINE_AA)
         pill(canvas,"DASHCAM","bike-mounted / moving vehicle","D",100,sel_mode=="dashcam")
@@ -920,7 +671,7 @@ def run_selector():
                     (68,311),cv2.FONT_HERSHEY_SIMPLEX,0.37,ACT,1,cv2.LINE_AA)
         cv2.putText(canvas,"D/F = mode      S/O = angle      ENTER = start",
                     (130,345),cv2.FONT_HERSHEY_SIMPLEX,0.36,HINT,1,cv2.LINE_AA)
-        cv2.imshow("Varroc Eureka PS3 — Setup",canvas)
+        cv2.imshow("Varroc Eureka PS3 Setup",canvas)
         key=cv2.waitKey(30)&0xFF
         if   key in (ord('d'),ord('D')): sel_mode="dashcam"
         elif key in (ord('f'),ord('F')): sel_mode="fixed"
@@ -928,11 +679,11 @@ def run_selector():
         elif key in (ord('o'),ord('O')): sel_angle="overhead"
         elif key in (13,10): break
         elif key==27: cv2.destroyAllWindows(); raise SystemExit("Cancelled.")
-    cv2.destroyWindow("Varroc Eureka PS3 — Setup")
+    cv2.destroyWindow("Varroc Eureka PS3 Setup")
     print(f"[MODE]  {sel_mode.upper()} / {sel_angle.upper()}")
     return sel_mode,sel_angle
 
-# ═══════════════════════════ MAIN ═══════════════════════════════════════════ #
+# ============================= MAIN ========================================= #
 
 def main():
     global CAMERA_MODE,CAMERA_ANGLE
@@ -951,18 +702,18 @@ def main():
     print(f"[INFO] FPS:{fps:.0f}  Mode:{CAMERA_MODE}  Angle:{CAMERA_ANGLE}  "
           f"Conf:{active_conf}  Classes:{active_classes}")
 
-    # ── Initialise subsystems ──────────────────────────────────────────────
-    tracker     = IoUTracker()
-    ego_est     = EgoMotionEstimator() if CAMERA_MODE=="dashcam" else None
-    dense_flow  = DenseFlowEstimator() if CAMERA_MODE=="dashcam" else None
-    fleet       = FleetContext()
-    helmet_det  = HelmetDetector()
-    homo_cal    = HomographyCalibrator() if CAMERA_MODE=="fixed" else None
-    homo_ready  = False
-
+    if BYTETRACK_AVAILABLE:
+        tracker = ByteTrackWrapper(fps)
+        print("[INFO] Using ByteTrack")
+    else:
+        tracker = IoUTracker()
+        print("[INFO] Using built-in IoU tracker")
+    ego_est    = EgoMotionEstimator() if CAMERA_MODE=="dashcam" else None
+    fleet      = FleetContext()
+    helmet_det = HelmetDetector()
     behaviors: dict[int,RiderBehavior] = {}
     all_time:  dict[int,RiderBehavior] = {}
-    n=0; homo_calibrated=False
+    n=0
 
     while True:
         ret,frame=cap.read()
@@ -971,18 +722,8 @@ def main():
         frame=cv2.resize(frame,(FRAME_W,FRAME_H))
         gray =cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
 
-        # ── Homography calibration (fixed cam, first frame only) ──────────
-        if homo_cal is not None and not homo_calibrated:
-            if not homo_cal.load(HOMOGRAPHY_MATRIX):
-                homo_cal.calibrate(frame)
-            homo_calibrated=True
-            homo_ready=homo_cal.ready
-
-        # ── Ego-motion + dense flow (dashcam only) ─────────────────────────
         raw_edx,raw_edy=(ego_est.update(gray) if ego_est else (0.0,0.0))
-        if dense_flow: dense_flow.update(gray)
 
-        # ── Detection ─────────────────────────────────────────────────────
         results=model(frame,conf=min(active_conf,PERSON_CONF),verbose=False)[0]
         det_bikes=[]; person_boxes=[]
         for b in results.boxes:
@@ -990,15 +731,12 @@ def main():
             if cls in active_classes and conf>=active_conf: det_bikes.append((box,cls))
             elif cls==0 and conf>=PERSON_CONF: person_boxes.append(box)
 
-        # ── Track ─────────────────────────────────────────────────────────
         tracker.update([b for b,_ in det_bikes])
         det_cls_map={b:c for b,c in det_bikes}
         active=tracker.active_tracks
 
-        # ── Fleet ─────────────────────────────────────────────────────────
         fleet.update(behaviors)
 
-        # ── Camera speed (dashcam) ─────────────────────────────────────────
         if ego_est and behaviors:
             mpp_vals=[float(np.median(list(bv._mpp_hist)))
                       for bv in behaviors.values() if bv._mpp_hist]
@@ -1008,88 +746,72 @@ def main():
         else:
             camera_speed_mps=0.0
 
-        # ── Per-rider update ───────────────────────────────────────────────
         for tid,td in active.items():
             if tid not in behaviors: behaviors[tid]=RiderBehavior(tid,fps)
             b=behaviors[tid]
-
             cx,cy=td['cx'],td['cy']
-
-            # Ego compensation
             df    =EgoMotionEstimator.depth_factor(cy) if ego_est else 1.0
             edx_v =raw_edx*df if ego_est else 0.0
             edy_v =raw_edy*df if ego_est else 0.0
-            comp_dx=(float(cx)-(b._prev_cx or float(cx)))-edx_v
-            comp_dy=(float(cy)-(b._prev_cy or float(cy)))-edy_v
-
-            # World position (homography)
-            world_pos=None
-            if homo_cal and homo_ready:
-                wp=homo_cal.to_world(cx,cy)
-                if wp: world_pos=wp
-
-            # Farneback velocity for this vehicle
-            farne_vel=None
-            if dense_flow:
-                farne_vel=dense_flow.vehicle_velocity(td['box'])
-
+            # comp displacement: 1-frame centroid delta minus ego shift
+            if b._prev_cx is not None:
+                raw_dx=float(cx)-b._prev_cx; raw_dy=float(cy)-b._prev_cy
+            else:
+                raw_dx=raw_dy=0.0
+            comp_dx=raw_dx-edx_v; comp_dy=raw_dy-edy_v
             det_cls=det_cls_map.get(td['box'],3)
             b.update(cx,cy,td['box'],comp_dx,comp_dy,fleet,
-                     camera_speed_mps,det_cls,world_pos,farne_vel)
+                     camera_speed_mps,det_cls)
             all_time[tid]=b
 
-        # ── Helmet ────────────────────────────────────────────────────────
         statuses=helmet_det.update(gray,active,person_boxes)
         for tid,status in statuses.items():
             if tid in behaviors: behaviors[tid].set_helmet(status)
 
-        # ── Cleanup ───────────────────────────────────────────────────────
         alive=set(tracker.tracks.keys())
         for k in [k for k in behaviors if k not in alive]: del behaviors[k]
 
-        # ── Render ────────────────────────────────────────────────────────
         for tid,td in active.items():
             if tid in behaviors: draw_hud(frame,behaviors[tid],td['box'])
-        draw_fleet_bar(frame,fleet,n,homo_ready)
+        draw_fleet_bar(frame,fleet,n)
         draw_ego_arrow(frame,raw_edx,raw_edy)
         active_beh={tid:behaviors[tid] for tid in active if tid in behaviors}
         draw_leaderboard(frame,active_beh)
         draw_footer(frame)
-        cv2.imshow("Varroc Eureka 3.0 — PS3 v6  [ESC to quit]",frame)
+        cv2.imshow("Varroc Eureka 3.0 - PS3 v5  [ESC to quit]",frame)
         if cv2.waitKey(1)&0xFF==27: break
 
-    # ── Final report ──────────────────────────────────────────────────────
+    # ── Final report ─────────────────────────────────────────────────────────
     W=102
     COLS=[("ID",5,"<"),("Score",7,">"),("km/h",7,">"),("Brakes",7,">"),
           ("Accel",6,">"),("Weave",6,">"),("Tailg",6,">"),("Stop",5,">"),
-          ("TTC_Ev",7,">"),("NoHlmt",7,">"),("Helmet",8,"^"),
-          ("Direction",10,"^"),("Stunt",6,"^"),("Rating",8,"^")]
-    def divider(l="├",m="┼",r="┤",f="─"):
+          ("NoHlmt",7,">"),("Helmet",8,"^"),("Direction",10,"^"),
+          ("Stunt",6,"^"),("Rating",8,"^")]
+    def divider(l="├",m="┼",r="┤",f="-"):
         return l+m.join(f*(w+2) for _,w,_ in COLS)+r
     def row_str(vals):
-        return "│"+"│".join(f" {v:{a}{w}} " for (_,w,a),v in zip(COLS,vals))+"│"
+        return "|"+"│".join(f" {v:{a}{w}} " for (_,w,a),v in zip(COLS,vals))+"|"
 
-    print(); print("┌"+"─"*(W-2)+"┐")
-    print("│"+"VARROC EUREKA 3.0  —  PS3 DRIVING BEHAVIOR REPORT  v6".center(W-2)+"│")
+    print(); print("+" + "-"*(W-2) + "+")
+    print("|"+"VARROC EUREKA 3.0  --  PS3 DRIVING BEHAVIOR REPORT  v5".center(W-2)+"|")
     sub=(f"Vehicles:{len(all_time)}  Frames:{n}  Duration:{n/fps:.1f}s  "
-         f"Mode:{CAMERA_MODE.upper()}/{CAMERA_ANGLE.upper()}  "
-         f"Speed:{'Homography' if homo_ready else 'Kalman+Farneback'}")
-    print("│"+sub.center(W-2)+"│")
-    print("├"+"─"*(W-2)+"┤")
-    print(divider("├","┬","┤"))
+         f"Mode:{CAMERA_MODE.upper()}/{CAMERA_ANGLE.upper()}")
+    print("|"+sub.center(W-2)+"|")
+    print("+" + "-"*(W-2) + "+")
+    print(divider("+","+"," +"))
     print(row_str([h for h,_,_ in COLS]))
-    print(divider("├","┼","┤"))
+    print(divider("+","+"," +"))
     for i,(rid,b) in enumerate(sorted(all_time.items())):
-        helm=("YES ✓" if b.helmet_status=="HELMET"
-              else("NO  ✗" if b.helmet_status=="NO_HELMET" else "  ?  "))
+        helm=("YES" if b.helmet_status=="HELMET"
+              else("NO " if b.helmet_status=="NO_HELMET" else " ? "))
         vals=[f"#{rid}",f"{b.score:.1f}",f"{b.speed_kmh():.1f}",
               str(b.hard_brake_count),str(b.aggr_accel_count),
               str(b.weave_count),str(b.tailgate_count),str(b.sudden_stop_count),
-              str(b.ttc_event_count),str(b.no_helmet_count),helm,b.direction,
+              str(b.no_helmet_count),helm,b.direction,
               "YES" if b.is_doing_stunt else " no",f"[{b.score_label()}]"]
         print(row_str(vals))
         if i<len(all_time)-1: print(divider())
-    print(divider("└","┴","┘"))
+    print(divider("+","+"," +"))
     if all_time:
         scores=[b.score for b in all_time.values()]
         best =max(all_time,key=lambda k:all_time[k].score)
@@ -1098,18 +820,17 @@ def main():
         f_=sum(1 for b in all_time.values() if 50<=b.score<80)
         p=sum(1 for b in all_time.values() if b.score<50)
         nh=sum(1 for b in all_time.values() if b.no_helmet_count>0)
-        print(); print("┌"+"─"*(W-2)+"┐")
-        print("│"+"  SUMMARY".ljust(W-2)+"│")
-        print("├"+"─"*(W-2)+"┤")
+        print(); print("+" + "-"*(W-2) + "+")
+        print("|  SUMMARY".ljust(W-1)+"|")
+        print("+" + "-"*(W-2) + "+")
         for line in [
-            f"  Average Score  : {sum(scores)/len(scores):.1f}",
-            f"  Best Rider     : #{best}  ({max(scores):.1f} pts)",
-            f"  Worst Rider    : #{worst}  ({min(scores):.1f} pts)",
-            f"  GOOD (≥80): {g}   FAIR (50-79): {f_}   POOR (<50): {p}",
+            f"  Average Score : {sum(scores)/len(scores):.1f}",
+            f"  Best Rider    : #{best}  ({max(scores):.1f} pts)",
+            f"  Worst Rider   : #{worst}  ({min(scores):.1f} pts)",
+            f"  GOOD (>=80): {g}   FAIR (50-79): {f_}   POOR (<50): {p}",
             f"  No-Helmet Violations: {nh} rider(s)",
-            f"  Speed method: {'Homography (exact)' if homo_ready else 'Kalman+Farneback+MPP'}",
-        ]: print("│"+line.ljust(W-2)+"│")
-        print("└"+"─"*(W-2)+"┘")
+        ]: print("|"+line.ljust(W-2)+"|")
+        print("+" + "-"*(W-2) + "+")
     print(); cap.release(); cv2.destroyAllWindows()
 
 if __name__=="__main__":
