@@ -459,7 +459,7 @@ New tracks are flagged with a reliability score `min(100, frame_count / WARMUP_F
 
 ## Built By
 
-**Team [TEAM NAME]** — Indian Institute of Information Technology, Kottayam  
+**B.Akshay Sriram** — Indian Institute of Information Technology, Kottayam  
 B.Tech Computer Science & Engineering — AI and Data Science, 2027
 
 **Varroc Eureka 3.0 · Problem Statement 3**  
