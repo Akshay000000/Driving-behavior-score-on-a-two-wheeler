@@ -1,0 +1,30 @@
+# Node
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+/build
+/coverage
+
+# Media (IMPORTANT)
+/public/*.mp4
+
+# Python
+__pycache__/
+*.pyc
+
+# ML models (IMPORTANT)
+*.pt
+
+# Environment
+.env*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Misc
+.DS_Store
